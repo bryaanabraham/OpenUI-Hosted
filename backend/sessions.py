@@ -1,21 +1,9 @@
-"""
-Session store — in-memory conversation history keyed by session_id.
-
-Each session holds an ordered list of OpenAI-format message dicts:
-  [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}, ...]
-
-Sessions expire after SESSION_TTL_SECONDS of inactivity (default 2 hours).
-The background reaper task cleans up expired sessions every 10 minutes.
-"""
-
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Any
 
-# Expire sessions after 2 hours of inactivity
 SESSION_TTL_SECONDS: int = 60 * 60 * 2
-
 
 @dataclass
 class Session:
@@ -23,6 +11,17 @@ class Session:
     messages: list[dict] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
+
+    # JSON Architecture Cache
+    cached_layout: Optional[str] = None
+    cached_data: Optional[dict] = None
+    cached_query: Optional[str] = None
+    cached_script: Optional[str] = None
+    cached_schema: Optional[str] = None
+    cache_version: int = 0
+    
+    dataset_df: Optional[Any] = None
+    dataset_schema: Optional[str] = None
 
     def touch(self) -> None:
         self.last_active = time.time()
@@ -34,6 +33,35 @@ class Session:
         self.messages.append({"role": role, "content": content})
         self.touch()
 
+    def cache_dashboard(self, layout: str, data: dict, query: str, script: Optional[str] = None, schema: Optional[str] = None) -> None:
+        self.cached_layout = layout
+        self.cached_data = data
+        self.cached_query = query
+        self.cached_script = script
+        self.cached_schema = schema
+        self.cache_version += 1
+        self.touch()
+        
+    def update_data(self, new_data: dict) -> None:
+        if self.cached_data is None:
+            self.cached_data = {}
+        self.cached_data.update(new_data)
+        self.cache_version += 1
+        self.touch()
+        
+    def set_dataset(self, df: Any, schema: str) -> None:
+        self.dataset_df = df
+        self.dataset_schema = schema
+        self.touch()
+
+    def has_cache(self) -> bool:
+        return self.cached_layout is not None
+
+    def clear_cache(self) -> None:
+        self.cached_layout = None
+        self.cached_data = None
+        self.cached_query = None
+
     def to_dict(self) -> dict:
         return {
             "session_id": self.id,
@@ -41,28 +69,27 @@ class Session:
             "created_at": self.created_at,
             "last_active": self.last_active,
             "messages": self.messages,
+            "has_cache": self.has_cache(),
+            "cache_version": self.cache_version,
+            "cached_query": self.cached_query,
+            "cached_data": self.cached_data,
+            "cached_layout": self.cached_layout,
+            "has_dataset": self.dataset_df is not None,
+            "dataset_schema": self.dataset_schema
         }
 
 
 class SessionStore:
-    """Thread-safe (asyncio-safe) in-memory session store."""
-
     def __init__(self) -> None:
         self._sessions: dict[str, Session] = {}
 
-    # ------------------------------------------------------------------
-    # Session lifecycle
-    # ------------------------------------------------------------------
-
     def create(self) -> Session:
-        """Create a new empty session and return it."""
         session_id = str(uuid.uuid4())
         session = Session(id=session_id)
         self._sessions[session_id] = session
         return session
 
     def get(self, session_id: str) -> Optional[Session]:
-        """Return the session if it exists and hasn't expired."""
         session = self._sessions.get(session_id)
         if session is None:
             return None
@@ -72,11 +99,6 @@ class SessionStore:
         return session
 
     def get_or_create(self, session_id: Optional[str]) -> tuple[Session, bool]:
-        """
-        Return (session, is_new).
-
-        If session_id is None or not found, create a fresh session.
-        """
         if session_id:
             session = self.get(session_id)
             if session:
@@ -85,18 +107,15 @@ class SessionStore:
         return session, True
 
     def delete(self, session_id: str) -> bool:
-        """Delete a session. Returns True if it existed."""
         return self._sessions.pop(session_id, None) is not None
 
     def reap_expired(self) -> int:
-        """Remove expired sessions. Returns count of removed sessions."""
         expired = [sid for sid, s in self._sessions.items() if s.is_expired()]
         for sid in expired:
             del self._sessions[sid]
         return len(expired)
 
     def list_sessions(self) -> list[dict]:
-        """Return summary info for all active sessions."""
         self.reap_expired()
         return [
             {
@@ -108,6 +127,4 @@ class SessionStore:
             for s in self._sessions.values()
         ]
 
-
-# Singleton store — shared across all requests in the process lifetime
 store = SessionStore()
